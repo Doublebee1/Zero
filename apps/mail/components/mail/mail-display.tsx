@@ -16,15 +16,22 @@ import {
   Loader2,
   CopyIcon,
   CircleAlert,
+  MessageSquareText,
+  Tag,
+  Check,
 } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
 import { cn, formatDate, formatTime, shouldShowSeparateTime } from '@/lib/utils';
 import { Dialog, DialogTitle, DialogHeader, DialogContent } from '../ui/dialog';
+import { Textarea } from '../ui/textarea';
 import { memo, useEffect, useMemo, useState, useRef, useCallback } from 'react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
@@ -33,12 +40,13 @@ import type { Sender, ParsedMessage, Attachment } from '@/types';
 import { useActiveConnection } from '@/hooks/use-connections';
 import { useAttachments } from '@/hooks/use-attachments';
 import { useTRPC } from '@/providers/query-provider';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Markdown } from '@react-email/components';
 import { useSummary } from '@/hooks/use-summary';
 import { TextShimmer } from '../ui/text-shimmer';
 import { useThread } from '@/hooks/use-threads';
 import { BimiAvatar } from '../ui/bimi-avatar';
+import { useLabels } from '@/hooks/use-labels';
 import { PriorityScoreCircle } from './priority-score-circle';
 import { RemovableTextLabels } from './removable-text-labels';
 import { cleanHtml } from '@/lib/email-utils';
@@ -567,6 +575,8 @@ const MoreAboutQuery = ({
 
 const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }: Props) => {
   const [isCollapsed, setIsCollapsed] = useState<boolean>(false);
+  const [priorityScoreOverride, setPriorityScoreOverride] = useState<number | null>(null);
+  const [suggestedActionOverride, setSuggestedActionOverride] = useState<string | null>(null);
   const { data: threadData } = useThread(emailData.threadId ?? null);
   const { data: messageAttachments } = useAttachments(emailData.id);
   //   const [unsubscribed, setUnsubscribed] = useState(false);
@@ -580,6 +590,8 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
   //     url: string;
   //   }>(null);
   const [openDetailsPopover, setOpenDetailsPopover] = useState<boolean>(false);
+  const [openActionFeedbackDialog, setOpenActionFeedbackDialog] = useState<boolean>(false);
+  const [actionFeedbackMessage, setActionFeedbackMessage] = useState<string>('');
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const collapseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -587,7 +599,51 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
   const { data: activeConnection } = useActiveConnection();
   const [researchSender, setResearchSender] = useState<Sender | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
-  //   const trpc = useTRPC();
+  const trpc = useTRPC();
+  const queryClient = useQueryClient();
+  const { mutateAsync: submitClassificationCorrection } = useMutation(
+    trpc.mail.submitClassificationCorrection.mutationOptions(),
+  );
+  const { mutateAsync: submitActionSuggestionFeedback, isPending: isSubmittingActionFeedback } =
+    useMutation(trpc.mail.submitActionSuggestionFeedback.mutationOptions());
+
+  const { userLabels, systemLabels } = useLabels();
+  const allLabels = useMemo(() => [...userLabels, ...systemLabels], [userLabels, systemLabels]);
+  const { mutateAsync: modifyLabels, isPending: isMovingLabel } = useMutation(
+    trpc.mail.modifyLabels.mutationOptions(),
+  );
+
+  const currentLabelIds = useMemo(
+    () => new Set((emailData.tags ?? []).map((t) => t.id ?? t.name)),
+    [emailData.tags],
+  );
+
+  const handleMoveToLabel = async (labelId: string, labelName: string) => {
+    const isAlreadyApplied = currentLabelIds.has(labelId);
+    try {
+      await modifyLabels({
+        threadId: [emailData.threadId ?? emailData.id],
+        addLabels: isAlreadyApplied ? [] : [labelId],
+        removeLabels: isAlreadyApplied ? [labelId] : [],
+      });
+      toast.success(
+        isAlreadyApplied ? `Removed label "${labelName}"` : `Moved to "${labelName}"`,
+      );
+      await queryClient.invalidateQueries({
+        queryKey: trpc.mail.get.queryKey({ id: emailData.threadId ?? emailData.id }),
+      });
+    } catch (error) {
+      console.error('Failed to modify label:', error);
+      toast.error('Failed to update label.');
+    }
+  };
+
+  const emailScopedSuggestedAction = useMemo(() => {
+    if (suggestedActionOverride) return suggestedActionOverride;
+
+    const matchedMessage = threadData?.messages?.find((message) => message.id === emailData.id);
+    return matchedMessage?.suggestedAction ?? emailData.suggestedAction ?? null;
+  }, [suggestedActionOverride, threadData?.messages, emailData.id, emailData.suggestedAction]);
 
   const isLastEmail = useMemo(
     () => emailData.id === threadData?.latest?.id,
@@ -1069,9 +1125,161 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
     }
   };
 
-  // TODO_doorman : Implement priorityscorefeedback
-  const handlePriorityScoreFeedback = (_rating: 'low' | 'high') => {
-    alert('feedback is not implemented yet');
+  const handlePriorityScoreFeedback = async (rating: 'low' | 'high') => {
+    try {
+      const correctionInput: {
+        threadId: string;
+        messageId: string;
+        correctedPriority: 'low' | 'high';
+        currentPriorityScore?: number;
+      } = {
+        threadId: emailData.threadId ?? emailData.id,
+        messageId: emailData.id,
+        correctedPriority: rating,
+      };
+
+      if (emailData.priorityScore != null) {
+        correctionInput.currentPriorityScore = emailData.priorityScore;
+      }
+
+      const response = await submitClassificationCorrection(correctionInput);
+
+      if (response?.refreshed?.priorityScore != null) {
+        setPriorityScoreOverride(response.refreshed.priorityScore);
+      }
+
+      if (response?.refreshed?.suggestedAction) {
+        setSuggestedActionOverride(response.refreshed.suggestedAction);
+      }
+
+      const currentThreadId = emailData.threadId ?? emailData.id;
+      queryClient.setQueryData(
+        trpc.mail.get.queryKey({ id: currentThreadId }),
+        (existingThread: any) => {
+          if (!existingThread) return existingThread;
+
+          const updatedMessages = (existingThread.messages ?? []).map((message: any) => {
+            if (message.id !== emailData.id) return message;
+            return {
+              ...message,
+              priorityScore:
+                response?.refreshed?.priorityScore != null
+                  ? response.refreshed.priorityScore
+                  : message.priorityScore,
+              category: response?.refreshed?.category ?? message.category,
+              suggestedAction:
+                response?.refreshed?.suggestedAction ?? message.suggestedAction,
+            };
+          });
+
+          const updatedLatest = existingThread.latest?.id === emailData.id
+            ? {
+                ...existingThread.latest,
+                priorityScore:
+                  response?.refreshed?.priorityScore != null
+                    ? response.refreshed.priorityScore
+                    : existingThread.latest.priorityScore,
+                category: response?.refreshed?.category ?? existingThread.latest.category,
+                suggestedAction:
+                  response?.refreshed?.suggestedAction ?? existingThread.latest.suggestedAction,
+              }
+            : existingThread.latest;
+
+          return {
+            ...existingThread,
+            messages: updatedMessages,
+            latest: updatedLatest,
+          };
+        },
+      );
+
+      await queryClient.invalidateQueries({
+        queryKey: trpc.mail.get.queryKey({ id: currentThreadId }),
+      });
+
+      toast.success(
+        `Updated by LLM: priority score ${response?.refreshed?.priorityScore ?? 'saved'}`,
+      );
+    } catch (error) {
+      console.error('Failed to submit priority score feedback:', error);
+      toast.error('Failed to regenerate LLM result from your feedback.');
+    }
+  };
+
+  const handleActionSuggestionFeedback = async () => {
+    const trimmedFeedback = actionFeedbackMessage.trim();
+    if (!trimmedFeedback) return;
+
+    try {
+      const response = await submitActionSuggestionFeedback({
+        threadId: emailData.threadId ?? emailData.id,
+        messageId: emailData.id,
+        feedbackMessage: trimmedFeedback,
+        currentSuggestedAction: emailScopedSuggestedAction ?? undefined,
+        currentPriorityScore: emailData.priorityScore ?? undefined,
+      });
+
+      if (response?.refreshed?.priorityScore != null) {
+        setPriorityScoreOverride(response.refreshed.priorityScore);
+      }
+
+      if (response?.refreshed?.suggestedAction) {
+        setSuggestedActionOverride(response.refreshed.suggestedAction);
+      }
+
+      const currentThreadId = emailData.threadId ?? emailData.id;
+      queryClient.setQueryData(
+        trpc.mail.get.queryKey({ id: currentThreadId }),
+        (existingThread: any) => {
+          if (!existingThread) return existingThread;
+
+          const updatedMessages = (existingThread.messages ?? []).map((message: any) => {
+            if (message.id !== emailData.id) return message;
+            return {
+              ...message,
+              priorityScore:
+                response?.refreshed?.priorityScore != null
+                  ? response.refreshed.priorityScore
+                  : message.priorityScore,
+              category: response?.refreshed?.category ?? message.category,
+              suggestedAction:
+                response?.refreshed?.suggestedAction ?? message.suggestedAction,
+            };
+          });
+
+          const updatedLatest =
+            existingThread.latest?.id === emailData.id
+              ? {
+                  ...existingThread.latest,
+                  priorityScore:
+                    response?.refreshed?.priorityScore != null
+                      ? response.refreshed.priorityScore
+                      : existingThread.latest.priorityScore,
+                  category: response?.refreshed?.category ?? existingThread.latest.category,
+                  suggestedAction:
+                    response?.refreshed?.suggestedAction ?? existingThread.latest.suggestedAction,
+                }
+              : existingThread.latest;
+
+          return {
+            ...existingThread,
+            messages: updatedMessages,
+            latest: updatedLatest,
+          };
+        },
+      );
+
+      await queryClient.invalidateQueries({
+        queryKey: trpc.mail.get.queryKey({ id: currentThreadId }),
+      });
+
+      setOpenActionFeedbackDialog(false);
+      setActionFeedbackMessage('');
+      toast.success('Action feedback applied. LLM analysis refreshed.');
+    } catch (error) {
+      console.error('Failed to submit action suggestion feedback:', error);
+      toast.error('Failed to refresh analysis from your action feedback.');
+    }
   };
 
   const renderPerson = useCallback(
@@ -1161,6 +1369,45 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
             person={researchSender}
           />
         )}
+        <Dialog open={openActionFeedbackDialog} onOpenChange={setOpenActionFeedbackDialog}>
+          <DialogContent showOverlay onClick={(e) => e.stopPropagation()}>
+            <DialogHeader>
+              <DialogTitle>Improve Action Suggestion</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3">
+              <p className="text-muted-foreground text-sm">
+                Provide feedback for this email and we will update the prompt, resend to OpenAI,
+                and refresh the analysis result.
+              </p>
+              <Textarea
+                value={actionFeedbackMessage}
+                onChange={(event) => setActionFeedbackMessage(event.target.value)}
+                placeholder="Example: This is time-sensitive and should be marked as reply now."
+                className="min-h-[120px] resize-y"
+              />
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                  onClick={() => {
+                    setOpenActionFeedbackDialog(false);
+                    setActionFeedbackMessage('');
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="bg-primary text-primary-foreground rounded-md px-3 py-1.5 text-sm disabled:opacity-50"
+                  disabled={!actionFeedbackMessage.trim() || isSubmittingActionFeedback}
+                  onClick={() => void handleActionSuggestionFeedback()}
+                >
+                  {isSubmittingActionFeedback ? 'Regenerating...' : 'Regenerate Analysis'}
+                </button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
         <div className="relative h-full overflow-y-auto">
           <div className={cn('px-4', index === 0 && 'border-b py-4')}>
             {index === 0 && (
@@ -1179,9 +1426,9 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
                     <RemovableTextLabels labels={emailData.tags ?? []} />
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    {threadData?.latest?.suggestedAction ? (
+                    {emailScopedSuggestedAction ? (
                       <div className="border-border bg-muted max-w-[240px] truncate rounded-md border px-2 py-1 text-xs font-medium text-black dark:text-white">
-                        Suggested Action : {threadData.latest.suggestedAction}
+                        Suggested Action : {emailScopedSuggestedAction}
                       </div>
                     ) : null}
                     <div className="text-muted-foreground flex items-center gap-2 text-sm dark:text-[#8C8C8C]">
@@ -1237,7 +1484,7 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
                     name={emailData?.sender?.name}
                     className="h-8 w-8"
                   />
-                  <PriorityScoreCircle score={emailData?.priorityScore} />
+                  <PriorityScoreCircle score={priorityScoreOverride ?? emailData?.priorityScore} />
                 </div>
 
                 <div className="flex w-full items-center justify-between">
@@ -1447,6 +1694,65 @@ const MailDisplay = ({ emailData, index, totalEmails, demo, threadAttachments }:
                                 <CircleAlert className="text-iconLight dark:text-iconDark mr-2 h-4 w-4" />
                                 Priority score is high
                               </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setOpenActionFeedbackDialog(true);
+                                }}
+                              >
+                                <MessageSquareText className="text-iconLight dark:text-iconDark mr-2 h-4 w-4" />
+                                Feedback on action suggestion
+                              </DropdownMenuItem>
+                              <DropdownMenuSub>
+                                <DropdownMenuSubTrigger
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="cursor-pointer"
+                                >
+                                  <Tag className="text-iconLight dark:text-iconDark mr-2 h-4 w-4" />
+                                  Move to label
+                                </DropdownMenuSubTrigger>
+                                <DropdownMenuSubContent className="bg-card max-h-64 overflow-y-auto">
+                                  {allLabels.length === 0 ? (
+                                    <DropdownMenuItem disabled>
+                                      No labels available
+                                    </DropdownMenuItem>
+                                  ) : (
+                                    allLabels.map((label) => {
+                                      const applied = currentLabelIds.has(label.id ?? label.name);
+                                      return (
+                                        <DropdownMenuItem
+                                          key={label.id ?? label.name}
+                                          disabled={isMovingLabel}
+                                          onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            void handleMoveToLabel(
+                                              label.id ?? label.name,
+                                              label.name,
+                                            );
+                                          }}
+                                        >
+                                          <span
+                                            className="mr-2 h-2 w-2 rounded-full"
+                                            style={{
+                                              backgroundColor:
+                                                label.color?.backgroundColor || 'transparent',
+                                              border: label.color?.backgroundColor
+                                                ? undefined
+                                                : '1px solid currentColor',
+                                            }}
+                                          />
+                                          {label.name}
+                                          {applied && (
+                                            <Check className="ml-auto h-4 w-4 opacity-60" />
+                                          )}
+                                        </DropdownMenuItem>
+                                      );
+                                    })
+                                  )}
+                                </DropdownMenuSubContent>
+                              </DropdownMenuSub>
                               {(messageAttachments?.length ?? 0) > 0 && (
                                 <DropdownMenuItem
                                   disabled={!messageAttachments?.length}
