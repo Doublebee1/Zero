@@ -16,19 +16,19 @@ import {
   type WorkflowContext,
 } from './thread-workflow-utils/workflow-engine';
 import { getServiceAccount } from './lib/factories/google-subscription.factory';
+import { handleDoormanReceivedThread } from './lib/doorman/realtime-receiver';
 import { getThread, getZeroAgent } from './lib/server-utils';
 import { DurableObject } from 'cloudflare:workers';
 import { bulkDeleteKeys } from './lib/bulk-delete';
 import { type gmail_v1 } from '@googleapis/gmail';
 import { Effect, Console, Logger } from 'effect';
+import { initTracing } from './lib/tracing';
 import { connection } from './db/schema';
 import { EProviders } from './types';
 import type { ZeroEnv } from './env';
-import { initTracing } from './lib/tracing';
 import { EPrompts } from './types';
 import { eq } from 'drizzle-orm';
 import { createDb } from './db';
-import { handleDoormanReceivedThread } from './lib/doorman/realtime-receiver';
 
 // Configure pretty logger to stderr
 export const loggerLayer = Logger.add(Logger.prettyLogger({ stderr: true }));
@@ -147,8 +147,8 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
       attributes: {
         'provider.id': params.providerId,
         'history.id': params.historyId,
-        'subscription.name': params.subscriptionName
-      }
+        'subscription.name': params.subscriptionName,
+      },
     });
 
     return Effect.gen(this, function* () {
@@ -196,7 +196,9 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
         });
 
         yield* Console.log('[MAIN_WORKFLOW] Zero workflow result:', result);
-        span.setAttributes({ 'workflow.result': typeof result === 'string' ? result : JSON.stringify(result) });
+        span.setAttributes({
+          'workflow.result': typeof result === 'string' ? result : JSON.stringify(result),
+        });
       } else {
         yield* Console.log('[MAIN_WORKFLOW] Unsupported provider:', providerId);
         span.setAttributes({ 'error.type': 'unsupported_provider' });
@@ -211,11 +213,13 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
       return 'Workflow completed successfully';
     }).pipe(
       Effect.tap(() => Effect.sync(() => span.end())),
-      Effect.tapError((error) => Effect.sync(() => {
-        span.recordException(error as unknown as Error);
-        span.setStatus({ code: 2, message: String(error) });
-        span.end();
-      })),
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          span.recordException(error as unknown as Error);
+          span.setStatus({ code: 2, message: String(error) });
+          span.end();
+        }),
+      ),
       Effect.tapError((error) => Console.log('[MAIN_WORKFLOW] Error in workflow:', error)),
       Effect.provide(loggerLayer),
       Effect.runPromise,
@@ -385,15 +389,15 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
                 try: async () => {
                   const result = await agent.syncThread({ threadId });
 
-		  await handleDoormanReceivedThread({
-  		    connectionId,
-  		    userId: foundConnection.userId,
-		    providerId: foundConnection.providerId,
-  		    threadId,
-		    historyId,
-		    source: 'gmail-watch',
-		    receivedAt: new Date().toISOString(),
-		  });
+                  await handleDoormanReceivedThread({
+                    connectionId,
+                    userId: foundConnection.userId,
+                    providerId: foundConnection.providerId,
+                    threadId,
+                    historyId,
+                    source: 'gmail-watch',
+                    receivedAt: new Date().toISOString(),
+                  });
 
                   console.log(`[ZERO_WORKFLOW] Successfully synced thread ${threadId}`);
                   return { threadId, result };
@@ -407,7 +411,7 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
                 },
               }),
             ),
-            { concurrency: 6 }, // Limit concurrency to avoid rate limits
+            { concurrency: 1 }, // Limit concurrency to avoid rate limits
           );
 
           const syncedCount = syncResults.filter((result) => result.result.success).length;
@@ -462,7 +466,7 @@ export class WorkflowRunner extends DurableObject<ZeroEnv> {
                   ),
                 ),
               ),
-              { concurrency: 6 }, // Limit concurrency to avoid overwhelming the system
+              { concurrency: 1 }, // Limit concurrency to avoid overwhelming the system
             );
 
             const threadWorkflowSuccessCount = threadWorkflowResults.length;

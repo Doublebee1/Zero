@@ -611,20 +611,68 @@ export const connectionToDriver = (activeConnection: typeof connection.$inferSel
   });
 };
 
-export const verifyToken = async (token: string) => {
-  const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  if (!response.ok) {
-    throw new Error(`Failed to verify token: ${await response.text()}`);
+const isRetryableTokenError = (error: any) => {
+  const message = String(error?.message || error || '');
+  const code = error?.code || error?.errno;
+
+  return (
+    error?.retryable === true ||
+    message.includes('Network connection lost') ||
+    message.includes('fetch failed') ||
+    message.includes('timeout') ||
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNABORTED' ||
+    code === 'EAI_AGAIN'
+  );
+};
+
+export const verifyToken = async (token: string) => {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as any;
+        return !!data;
+      }
+
+      if ([400, 401, 403].includes(response.status)) {
+        console.warn('[VERIFY_TOKEN] Invalid Google token', { status: response.status });
+        return false;
+      }
+
+      if ((response.status === 429 || response.status >= 500) && attempt < maxAttempts) {
+        await sleep(500 * 2 ** (attempt - 1));
+        continue;
+      }
+
+      throw new Error(`Failed to verify token: ${response.status} ${await response.text()}`);
+    } catch (error) {
+      if (isRetryableTokenError(error) && attempt < maxAttempts) {
+        console.warn('[VERIFY_TOKEN] Retrying Google token verification', {
+          attempt,
+          nextAttempt: attempt + 1,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await sleep(500 * 2 ** (attempt - 1));
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  const data = (await response.json()) as any;
-  return !!data;
+  return false;
 };
 
 
